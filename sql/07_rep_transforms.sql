@@ -17,6 +17,16 @@
 -- below, following rep.transform_fact_incident, then add one CALL line to
 -- elt.run_transforms. Re-run this file.
 --
+-- Every date and time column also carries a surrogate key into the conformed
+-- dimensions - date_occurred and date_occurred_key, and so on. Reports join
+-- and slice on the key; the plain value stays for detail rows and tooltips.
+-- rep.date_key() and rep.time_key(), defined in 08, resolve a value that is
+-- NULL or outside the dimension's range to the sentinel -1, so such a record
+-- still counts and shows as Unknown rather than vanishing from the report.
+--
+-- 08_rep_dimensions.sql must be run before the first transform: it creates
+-- those functions, the dimensions they read, and the foreign keys.
+--
 -- Safe to re-run. Run as an administrator, connected to pp_rdw.
 -- ---------------------------------------------------------------------------
 
@@ -41,10 +51,15 @@ CREATE TABLE IF NOT EXISTS rep.fact_incident (
     modification_date_timestamp  timestamp,
     crime_type                   text,
     date_occurred                date,
+    date_occurred_key            integer,
     time_occurred                time,
+    time_occurred_key            integer,
     date_reported                date,
+    date_reported_key            integer,
     time_received                time,
+    time_received_key            integer,
     time_dispatched              time,
+    time_dispatched_key          integer,
     finalisation_status          text,
     incident_village             text,
     section                      text,
@@ -61,9 +76,14 @@ CREATE TABLE IF NOT EXISTS rep.fact_incident (
     transformed_at               timestamp NOT NULL DEFAULT clock_timestamp()
 );
 
--- For a table that already existed before transformed_at was added.
+-- For a table that already existed before these columns were added.
 ALTER TABLE rep.fact_incident
-    ADD COLUMN IF NOT EXISTS transformed_at timestamp NOT NULL DEFAULT clock_timestamp();
+    ADD COLUMN IF NOT EXISTS transformed_at      timestamp NOT NULL DEFAULT clock_timestamp(),
+    ADD COLUMN IF NOT EXISTS date_occurred_key   integer,
+    ADD COLUMN IF NOT EXISTS time_occurred_key   integer,
+    ADD COLUMN IF NOT EXISTS date_reported_key   integer,
+    ADD COLUMN IF NOT EXISTS time_received_key   integer,
+    ADD COLUMN IF NOT EXISTS time_dispatched_key integer;
 
 -- Each call takes everything that reached stg.pp since the previous call,
 -- keeps the latest version of each record, and upserts it.
@@ -102,8 +122,10 @@ BEGIN
     INSERT INTO rep.fact_incident (
         pk_incident, incident_no, call_type, call_source,
         creation_date_timestamp, modification_date_timestamp, crime_type,
-        date_occurred, time_occurred, date_reported, time_received,
-        time_dispatched, finalisation_status, incident_village, section,
+        date_occurred, date_occurred_key, time_occurred, time_occurred_key,
+        date_reported, date_reported_key, time_received, time_received_key,
+        time_dispatched, time_dispatched_key,
+        finalisation_status, incident_village, section,
         location, location_of_incident_street, location_of_incident_other,
         flag_alcohol, flag_domestic, flag_narcotics, narcotics_type,
         flag_mental_health, flag_significant, loaded_at)
@@ -116,10 +138,15 @@ BEGIN
         stg.try_ts(modification_date_timestamp),
         crime_type,
         stg.try_date(date_occurred),
+        rep.date_key(stg.try_date(date_occurred)),
         stg.try_time(time_occurred),
+        rep.time_key(stg.try_time(time_occurred)),
         stg.try_date("date"),
+        rep.date_key(stg.try_date("date")),
         stg.try_time(time_received),
+        rep.time_key(stg.try_time(time_received)),
         stg.try_time(time_dispatched),
+        rep.time_key(stg.try_time(time_dispatched)),
         finalisation_status,
         village,
         section,
@@ -158,10 +185,15 @@ BEGIN
         modification_date_timestamp = EXCLUDED.modification_date_timestamp,
         crime_type                  = EXCLUDED.crime_type,
         date_occurred               = EXCLUDED.date_occurred,
+        date_occurred_key           = EXCLUDED.date_occurred_key,
         time_occurred               = EXCLUDED.time_occurred,
+        time_occurred_key           = EXCLUDED.time_occurred_key,
         date_reported               = EXCLUDED.date_reported,
+        date_reported_key           = EXCLUDED.date_reported_key,
         time_received               = EXCLUDED.time_received,
+        time_received_key           = EXCLUDED.time_received_key,
         time_dispatched             = EXCLUDED.time_dispatched,
+        time_dispatched_key         = EXCLUDED.time_dispatched_key,
         finalisation_status         = EXCLUDED.finalisation_status,
         incident_village            = EXCLUDED.incident_village,
         section                     = EXCLUDED.section,
@@ -227,6 +259,7 @@ CREATE TABLE IF NOT EXISTS rep.fact_incident_charge (
     attempt                      boolean,
     judge                        text,
     disp_date                    date,
+    disp_date_key                integer,
     disp_sentence                text,
     conviction                   boolean,
     counts                       numeric,
@@ -236,7 +269,8 @@ CREATE TABLE IF NOT EXISTS rep.fact_incident_charge (
 
 -- For a table that already existed before transformed_at was added.
 ALTER TABLE rep.fact_incident_charge
-    ADD COLUMN IF NOT EXISTS transformed_at timestamp NOT NULL DEFAULT clock_timestamp();
+    ADD COLUMN IF NOT EXISTS transformed_at timestamp NOT NULL DEFAULT clock_timestamp(),
+    ADD COLUMN IF NOT EXISTS disp_date_key  integer;
 
 -- Same shape as rep.transform_fact_incident: everything that reached stg.charges
 -- since the last call, latest version of each record, upserted.
@@ -273,7 +307,7 @@ BEGIN
     INSERT INTO rep.fact_incident_charge (
         pk_incident_charge, arrest_no, creation_date_timestamp, created_by,
         modification_date_timestamp, fk_incident, fk_law, fk_arrest, code,
-        class, offense, attempt, judge, disp_date, disp_sentence, conviction,
+        class, offense, attempt, judge, disp_date, disp_date_key, disp_sentence, conviction,
         counts, loaded_at)
     SELECT
         __pkeycharge_id,
@@ -292,6 +326,7 @@ BEGIN
         nullif(btrim(attempt), '')    IS NOT NULL,
         judge,
         stg.try_date(disp_date),
+        rep.date_key(stg.try_date(disp_date)),
         disp_sentence,
         nullif(btrim(conviction), '') IS NOT NULL,
         stg.try_numeric(counts),
@@ -319,6 +354,7 @@ BEGIN
         attempt                     = EXCLUDED.attempt,
         judge                       = EXCLUDED.judge,
         disp_date                   = EXCLUDED.disp_date,
+        disp_date_key               = EXCLUDED.disp_date_key,
         disp_sentence               = EXCLUDED.disp_sentence,
         conviction                  = EXCLUDED.conviction,
         counts                      = EXCLUDED.counts,

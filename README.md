@@ -15,7 +15,8 @@ sql/03_stg_schema.sql             staging
 sql/04_lnd_schema.sql             landing - re-run after adding a staging table
 sql/05_elt_schema.sql             load audit and the monitoring views
 sql/06_rep_schema.sql             reporting - schema, data currency view
-sql/07_rep_transforms.sql         reporting tables and the incremental transform
+sql/07_rep_dimensions.sql         conformed dimensions - dim_date, dim_time
+sql/08_rep_transforms.sql         reporting tables and the incremental transform
 ```
 
 The SQL files are numbered in the order they are run, and that order is a
@@ -67,7 +68,8 @@ psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/03_stg_schema.sql
 psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/04_lnd_schema.sql
 psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/05_elt_schema.sql
 psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/06_rep_schema.sql
-psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/07_rep_transforms.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/07_rep_dimensions.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/08_rep_transforms.sql
 ```
 
 `03` carries the staging table DDL. Against a source that has not been profiled
@@ -158,44 +160,6 @@ one atomic step rather than spread across every batch.
 **Four counts, because they isolate the failure:** source against extracted is a
 truncated fetch, extracted against staged is a loss writing to `lnd`, staged
 against loaded is a failed append.
-
-## Reference tables
-
-A table the source has no modification timestamp for - a code list such as LAW -
-cannot be read incrementally, and a nightly full refresh would append a complete
-copy to the append-only staging history every night. So it is **checked rather
-than loaded**. A config entry with **no `watermark_column`** is a reference
-table; nothing else marks it.
-
-Each run compares the row count at source with the staging table:
-
-| | |
-|---|---|
-| staging empty | Seeds it - the full table is loaded, as a first load. |
-| counts match | Nothing is read beyond the count. Logged, recorded as succeeded. |
-| counts differ | The full table lands in `lnd`, `stg` is left untouched, and the table is recorded as **`drift`**. |
-
-Drift does not fail the run. It needs a person, not a retry, and the other
-tables should still reach `rep` that night. It surfaces in
-`elt.v_load_exceptions`, the daily check, and in the log.
-
-**To accept a drifted version**, as an administrator:
-
-```sql
--- see what changed first
-SELECT * FROM lnd.law EXCEPT SELECT * FROM stg.law;
-TRUNCATE stg.law;
-```
-
-then run the extractor again - the empty target loads it as a seed - and
-`CALL elt.run_transforms();`. The truncate is deliberate and administrative:
-`svc_py` has no TRUNCATE on `stg`, so the pipeline cannot replace a reference
-table on its own.
-
-Two limits worth knowing. Counting detects insertions and deletions, not an
-edit in place, so the periodic re-profile remains the backstop. And the upsert
-into `rep` never deletes, so a code removed at source stays in the reporting
-model until it is removed by hand.
 
 ## Re-seeding
 
@@ -425,8 +389,9 @@ is the signal that the fill-rate profile is due to be re-run.
 
 ## The transform, and data currency
 
-`sql/07_rep_transforms.sql` builds `rep.fact_incident` and the procedure that
-maintains it. `fm_extract.py` calls it at the end of every run that reconciled:
+`sql/08_rep_transforms.sql` builds `rep.fact_incident` and
+`rep.fact_incident_charge`, and the procedures that maintain them.
+`fm_extract.py` calls the entry point at the end of every run that reconciled:
 
 ```sql
 CALL elt.run_transforms();   -- by hand, at any time; does nothing if nothing is new
@@ -440,10 +405,31 @@ failed but the loads stay; the watermark did not move, so the next run picks
 the same rows up.
 
 Adding a reporting table: add its `CREATE TABLE` and a procedure modelled on
-`rep.transform_fact_incident` to `07`, add one `CALL` line to
+`rep.transform_fact_incident` to `08`, add one `CALL` line to
 `elt.run_transforms`, and re-run the file.
 
-Two decisions behind it are worth knowing.
+### Dimensions and keys
+
+`sql/07_rep_dimensions.sql` generates `rep.dim_date` and `rep.dim_time`. They
+have no source, take nothing from PolicePro, and are not part of the nightly
+run; extending the date range means editing two dates in that file and
+re-running it, which adds only the new days.
+
+Every date and time on a fact carries a **surrogate key** as well as the value
+- `date_occurred` and `date_occurred_key`. Reports join and slice on the key;
+the value stays for detail rows. `rep.date_key()` and `rep.time_key()` do the
+resolution, so the rule lives in one place, and each dimension has a **sentinel
+row, key -1, labelled Unknown**. A date that is missing, unparseable or outside
+the range resolves to it, so the record still counts and shows as Unknown
+rather than dropping out of the report. Six foreign keys make that the only
+possible outcome.
+
+That is what makes a mis-keyed date visible instead of plausible: a date of
+birth typed into `date_occurred` reads as Unknown, not as a 1985 incident.
+`rep.v_dim_coverage` counts them, separating dates outside the range from
+dates not recorded at all, and warns before the dimension's range runs out.
+
+Two decisions behind the transform are worth knowing.
 
 **The transform is incremental, watermarked on `stg.loaded_at`** - not on the
 source modification timestamp. `loaded_at` is the warehouse's own clock: it
