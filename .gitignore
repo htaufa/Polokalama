@@ -2,6 +2,7 @@
 # *.config.example.json is tracked
 *.config*.json
 !*.config.example.json
+!fm_extract.config.cols.json
 
 # Generated export and scratch notes — not source
 README.html
