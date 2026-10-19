@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS rep.dim_date (
     iso_year            integer NOT NULL,
     iso_week            integer NOT NULL,
     iso_week_label      text    NOT NULL,      -- 2026-W39
+    week_start          date,                  -- Monday, ISO
+    week_end            date,                  -- Sunday
     is_weekend          boolean NOT NULL,
     month_start         date,
     month_end           date,
@@ -71,6 +73,15 @@ CREATE TABLE IF NOT EXISTS rep.dim_date (
     fiscal_quarter_label text   NOT NULL,      -- 2026/27 Q1
     CONSTRAINT dim_date_sentinel_ck CHECK ((date_key = -1) = (date IS NULL))
 );
+
+-- For a table created before week_start and week_end were added. The insert
+-- below only adds missing days, so existing rows need filling separately.
+ALTER TABLE rep.dim_date ADD COLUMN IF NOT EXISTS week_start date;
+ALTER TABLE rep.dim_date ADD COLUMN IF NOT EXISTS week_end   date;
+UPDATE rep.dim_date
+SET    week_start = date_trunc('week', date)::date,
+       week_end   = (date_trunc('week', date) + INTERVAL '6 days')::date
+WHERE  date IS NOT NULL AND (week_start IS NULL OR week_end IS NULL);
 
 -- For a table created before the sentinel row was introduced.
 ALTER TABLE rep.dim_date ALTER COLUMN date        DROP NOT NULL;
@@ -84,17 +95,30 @@ ALTER TABLE rep.dim_date ADD  CONSTRAINT dim_date_sentinel_ck CHECK ((date_key =
 -- The sentinel. Everything a report might group by reads Unknown, and every
 -- numeric attribute is -1, so a mis-keyed date can never be mistaken for a
 -- real one or quietly averaged into anything.
-INSERT INTO rep.dim_date VALUES (
+INSERT INTO rep.dim_date (
+    date_key, date, year, quarter, quarter_label, month, month_name,
+    month_short, year_month, month_label, day, day_of_week, day_name,
+    day_short, day_of_year, iso_year, iso_week, iso_week_label,
+    week_start, week_end, is_weekend, month_start, month_end,
+    fiscal_year, fiscal_year_label, fiscal_quarter, fiscal_quarter_label)
+VALUES (
     -1, NULL, -1, -1, 'Unknown', -1, 'Unknown', 'Unk', -1, 'Unknown', -1,
-    -1, 'Unknown', 'Unk', -1, -1, -1, 'Unknown', false, NULL, NULL,
+    -1, 'Unknown', 'Unk', -1, -1, -1, 'Unknown', NULL, NULL, false, NULL, NULL,
     -1, 'Unknown', -1, 'Unknown')
 ON CONFLICT (date_key) DO NOTHING;
 
-INSERT INTO rep.dim_date
+-- Columns listed explicitly. A positional INSERT would silently shift every
+-- value the next time a column is added in the middle of the table.
+INSERT INTO rep.dim_date (
+    date_key, date, year, quarter, quarter_label, month, month_name,
+    month_short, year_month, month_label, day, day_of_week, day_name,
+    day_short, day_of_year, iso_year, iso_week, iso_week_label,
+    week_start, week_end, is_weekend, month_start, month_end,
+    fiscal_year, fiscal_year_label, fiscal_quarter, fiscal_quarter_label)
 WITH bounds AS (
     -- >>> the only lines to edit when extending the range <<<
-    SELECT DATE '2025-01-01' AS from_date,
-           DATE '2027-12-31' AS to_date
+    SELECT DATE '2024-01-01' AS from_date,
+           DATE '2030-12-31' AS to_date
 ),
 days AS (
     SELECT generate_series(from_date, to_date, INTERVAL '1 day')::date AS d
@@ -118,6 +142,9 @@ SELECT to_char(d, 'YYYYMMDD')::integer,
        extract(isoyear FROM d)::integer,
        extract(week    FROM d)::integer,
        to_char(d, 'IYYY-"W"IW'),
+       -- ISO weeks run Monday to Sunday, which is what date_trunc uses.
+       date_trunc('week', d)::date,
+       (date_trunc('week', d) + INTERVAL '6 days')::date,
        extract(isodow FROM d) >= 6,
        date_trunc('month', d)::date,
        (date_trunc('month', d) + INTERVAL '1 month - 1 day')::date,

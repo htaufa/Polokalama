@@ -28,7 +28,7 @@
 -- ---------------------------------------------------------------------------
 
 WITH src AS (
-    SELECT 'arr'::text AS source_table          -- <<< the only line to edit
+    SELECT 'NAMES'::text AS source_table          -- <<< the only line to edit
 ),
 latest AS (
     SELECT p.*
