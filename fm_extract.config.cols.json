@@ -32,7 +32,7 @@
 			"source_table": "PP",
 			"target_table": "stg.pp",
 			"staging_table": "lnd.pp",
-			"key_column": "rec_current",
+			"key_column": "__pkeypolicepro_id",
 			"watermark_column": "modification_date_timestamp",
 			"columns": [
                 "add_dispatch_1_cue",
@@ -385,7 +385,7 @@
     "source_table": "CONT",
     "target_table": "stg.cont",
     "staging_table": "lnd.cont",
-    "key_column": "NO UNIQUE COMPLETE COLUMN IN THE PROFILE - SET THIS BY HAND",
+    "key_column": "__pkeycontact_id",
     "watermark_column": "modification_date_timestamp",
     "columns": [
                 "address_2",

@@ -55,8 +55,8 @@ CREATE SCHEMA IF NOT EXISTS stg;
 -- And the upsert into rep needs the natural key to be unique, which is worth
 -- asserting here rather than assuming:
 --
-   CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_pp_key_loaded
-       ON stg.pp ("__pkeypolicepro_id", loaded_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_pp_key_loaded
+    ON stg.pp ("__pkeypolicepro_id", loaded_at);
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_arr_key_loaded
 	ON stg.arr ("__pkeyarrest_id", loaded_at);
