@@ -321,6 +321,7 @@ seconds.
 ```
 py fm_discover.py --list                      tables the catalog reports
 py fm_discover.py --probe                     which of them can actually be read
+py fm_discover.py --probe --json rows.json     the same sweep, keeping each first row
 py fm_discover.py --table Charges --limit 2000    a quick look
 py fm_discover.py --table Charges             the real thing
 py fm_discover.py --profile dsc.charges       re-profile without re-pulling
@@ -351,7 +352,53 @@ return immediately, so several hundred tables takes minutes.
 py fm_discover.py --probe                     everything in the catalog
 py fm_discover.py --probe --like '%CHARGE%'   a subset
 py fm_discover.py --probe --probe-timeout 90  for a table that timed out
+py fm_discover.py --probe --json rows.json    and keep what each table holds
 ```
+
+`--json` keeps the row rather than discarding it. The probe already reads one
+row per table to establish readability, so adding a path costs no extra time at
+the source and one sweep answers both questions at once: which tables can be
+read, and what is actually in them.
+
+The file is ragged by design. A readable table carries `first_row`; an
+unreadable one carries the driver's error instead; a readable table with no rows
+carries neither. The header records the database, the account, the timeout and
+the verdict tally, so the file stands on its own as a record of the run:
+
+```json
+{
+  "probed_at": "2026-10-21T22:14:07",
+  "database": "PolicePro",
+  "account": "svc_reporting",
+  "tally": { "ok": 379, "missing": 130 },
+  "tables": [
+    { "source_table": "PP", "status": "ok", "column_count": 164,
+      "has_rows": true,
+      "first_row": { "__pkeypolicepro_id": "...", "village": "Kolofo'ou" } },
+    { "source_table": "GONE", "status": "missing", "native_error": 100,
+      "message": "<File Missing>" }
+  ]
+}
+```
+
+It is written through a temporary file and renamed, from a `finally` block, so
+Ctrl-C leaves a complete and parseable file of everything probed so far - the
+same promise `--probe` already makes for `dsc.table_probe`.
+
+Three things happen to the values, each to stop the file breaking in a way that
+would not be obvious. A container field is recorded as `{"container_bytes": n}`
+rather than embedded, because a photo as base64 makes the file unreadable and
+enormous. A duplicate column name is suffixed `name#2`: FileMaker can expose two
+fields that normalise to the same name, and a plain mapping would keep only the
+last, leaving the sample a column short without saying so. A non-finite number
+is written as a string, so the float-based Number type cannot produce a bare
+`NaN` that no strict parser accepts. Dates and times need nothing - they arrive
+as text already, through the output converters in `connect_filemaker`.
+
+**It holds one real record from every readable table.** Names, dates of birth,
+addresses, charges - whatever each table carries. Treat the file as a police
+record: write it on the application server, and keep it out of any synchronised
+folder, for the same reason the config is kept out of one.
 
 ```sql
 SELECT * FROM dsc.v_readable_tables;     -- the working list
@@ -603,18 +650,3 @@ recording how far it got.
 **The audit connection is separate and in autocommit.** Sharing the load's
 connection would mean a failed batch rolled back the record of its own failure -
 so the runs most needing evidence would leave none.
-
-## Not yet done
-
-- The transform call is a marked TODO in `fm_extract.py`
-- Only `PP` is configured; other tables need their base table names and
-  watermark columns confirmed
-- `stg` appends, so a record modified twice appears twice. De-duplication to
-  latest-by-watermark belongs in the transform
-- Failure notification is unconfigured. `elt.v_heartbeat` and
-  `elt.v_stalled_runs` are the intended basis, run from pg_cron on the reporting
-  server - deliberately not on the extraction host, since the failure most
-  needing detection is that host being unavailable
-- The log file does not rotate
-- `stg.pp_raw` from the original discovery belongs in `dsc`, or can be dropped
-  now the profile is captured

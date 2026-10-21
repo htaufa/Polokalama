@@ -47,7 +47,10 @@ operational data - do not export the profile without checking what is in it.
 """
 
 import argparse
+import decimal
 import getpass
+import json
+import math
 import os
 import re
 import sys
@@ -216,7 +219,13 @@ def classify(exc):
 
 
 def probe_one(fm_cn, name, timeout):
-    """SELECT one row. Returns (status, column_count, has_rows, native, state, msg).
+    """SELECT one row. Returns (status, column_count, has_rows, native, state,
+    msg, sample).
+
+    sample is the first row as an ordered mapping of column name to value, or
+    None when the table could not be read or holds no rows. The row is already
+    fetched to establish readability - keeping it costs nothing and is what
+    --json writes out.
 
     A fresh cursor each time: a pyodbc cursor that has raised is not reliably
     reusable, and reusing one would make the next table's verdict depend on the
@@ -231,15 +240,91 @@ def probe_one(fm_cn, name, timeout):
         cur.execute("SELECT * FROM %s FETCH FIRST 1 ROWS ONLY" % quote(name))
         rows = cur.fetchall()
         ncols = len(cur.description) if cur.description else 0
-        return "ok", ncols, bool(rows), None, None, None
+        sample = None
+        if rows and cur.description:
+            sample = row_to_mapping(cur.description, rows[0])
+        return "ok", ncols, bool(rows), None, None, None, sample
     except pyodbc.Error as exc:
         status, native, state, msg = classify(exc)
-        return status, None, None, native, state, msg
+        return status, None, None, native, state, msg, None
     finally:
         try:
             cur.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------- JSON sampling
+
+def jsonable(v):
+    """Make one FileMaker value safe to write as JSON.
+
+    Dates, times and timestamps already arrive as text: connect_filemaker
+    registers output converters for ODBC types 91/92/93, because a FileMaker
+    Time field may hold more than 24 hours and pyodbc raises while building the
+    object, losing the whole fetch. So nothing temporal reaches here.
+
+    What can: float, from FileMaker's float-based Number type; Decimal; and
+    bytes from a container field. A container's contents are not written out -
+    a photo or a PDF embedded in a sample file is neither readable nor wanted,
+    so only its size is recorded.
+    """
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        # NaN and infinity are not JSON. They would be written as bare NaN,
+        # which no strict parser accepts.
+        return v if math.isfinite(v) else str(v)
+    if isinstance(v, decimal.Decimal):
+        return float(v) if v.is_finite() else str(v)
+    if isinstance(v, (bytes, bytearray)):
+        return {"container_bytes": len(v)}
+    return str(v)
+
+
+def row_to_mapping(description, row):
+    """One row as column name to value, in the column order the driver gave.
+
+    Duplicate column names are possible - a FileMaker table can expose two
+    fields that normalise to the same name - and a plain dict would silently
+    keep only the last. The second and later occurrences are suffixed instead,
+    so no column disappears from the sample.
+    """
+    out = {}
+    for i, col in enumerate(description):
+        name = col[0] if col and col[0] else "column_%d" % (i + 1)
+        if name in out:
+            n = 2
+            while "%s#%d" % (name, n) in out:
+                n += 1
+            name = "%s#%d" % (name, n)
+        out[name] = jsonable(row[i])
+    return out
+
+
+def write_sample_json(path, cfg, timeout, entries, tally):
+    """Write the ragged sample file.
+
+    Ragged by design: each table carries the keys its own result justifies, so
+    a readable table has first_row and an unreadable one has the error instead.
+    Called from a finally block, so Ctrl-C still leaves a valid, partial file -
+    the same promise the probe makes for dsc.table_probe.
+    """
+    doc = {
+        "probed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "database": cfg["filemaker"]["database"],
+        "account": cfg["filemaker"]["username"],
+        "timeout_seconds": timeout,
+        "tables_probed": len(entries),
+        "tally": tally,
+        "tables": entries,
+    }
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False, allow_nan=False)
+        fh.write("\n")
+    os.replace(tmp, path)   # atomic, so an interrupted write cannot truncate
+    print("\nSample written to %s (%d tables)" % (path, len(entries)))
 
 
 PROBE_INSERT = """
@@ -250,7 +335,7 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
-def probe(fm_cn, pg_cn, cfg, names, timeout):
+def probe(fm_cn, pg_cn, cfg, names, timeout, json_path=None):
     with pg_cn.cursor() as c:
         c.execute("SELECT to_regclass('dsc.table_probe'), clock_timestamp()")
         exists, run_at = c.fetchone()
@@ -265,41 +350,72 @@ def probe(fm_cn, pg_cn, cfg, names, timeout):
     # column_profile uses now() rather than clock_timestamp(), arrived at from
     # the other direction: here the run outlives its transaction.
     print("Probing %d tables (timeout %ds each). Ctrl-C is safe - results are "
-          "committed as they are found.\n" % (len(names), timeout), flush=True)
+          "committed as they are found." % (len(names), timeout), flush=True)
+    if json_path is not None:
+        # Named before the run, not after: this file carries one real record
+        # from every readable table, so where it lands is worth seeing first.
+        print("Writing first rows to %s" % json_path, flush=True)
+    print(flush=True)
 
     tally = {}
-    for i, name in enumerate(sorted(names), 1):
-        t0 = time.time()
-        status, ncols, has_rows, native, state, msg = probe_one(fm_cn, name, timeout)
-
-        if status == "link":
-            # The session dropped rather than the table failing. Reconnect and
-            # give this table its one fair attempt before recording anything.
-            print("  ... connection dropped, reconnecting", flush=True)
-            try:
-                fm_cn.close()
-            except Exception:
-                pass
-            fm_cn = connect_filemaker(cfg["filemaker"])
+    entries = []
+    try:
+        for i, name in enumerate(sorted(names), 1):
             t0 = time.time()
-            status, ncols, has_rows, native, state, msg = probe_one(fm_cn, name, timeout)
+            status, ncols, has_rows, native, state, msg, sample = probe_one(
+                fm_cn, name, timeout)
 
-        elapsed = int((time.time() - t0) * 1000)
-        tally[status] = tally.get(status, 0) + 1
-        with pg_cn.cursor() as c:
-            c.execute(PROBE_INSERT, (name, status, status == "ok", ncols, has_rows,
-                                     elapsed, state, native, msg, run_at))
-        pg_cn.commit()
+            if status == "link":
+                # The session dropped rather than the table failing. Reconnect and
+                # give this table its one fair attempt before recording anything.
+                print("  ... connection dropped, reconnecting", flush=True)
+                try:
+                    fm_cn.close()
+                except Exception:
+                    pass
+                fm_cn = connect_filemaker(cfg["filemaker"])
+                t0 = time.time()
+                status, ncols, has_rows, native, state, msg, sample = probe_one(
+                    fm_cn, name, timeout)
 
-        if status == "ok":
-            detail = "%d column%s%s" % (ncols, "" if ncols == 1 else "s",
-                                        "" if has_rows else ", no rows")
-        else:
-            detail = FM_ERRORS.get(native, (None, msg))[1]
-            if len(detail) > 76:
-                detail = detail[:73] + "..."
-        print("  [%4d/%d] %-9s %-44s %s" % (i, len(names), status, name, detail),
-              flush=True)
+            elapsed = int((time.time() - t0) * 1000)
+            tally[status] = tally.get(status, 0) + 1
+            with pg_cn.cursor() as c:
+                c.execute(PROBE_INSERT, (name, status, status == "ok", ncols, has_rows,
+                                         elapsed, state, native, msg, run_at))
+            pg_cn.commit()
+
+            if json_path is not None:
+                entry = {"source_table": name, "status": status,
+                         "elapsed_ms": elapsed}
+                if status == "ok":
+                    entry["column_count"] = ncols
+                    entry["has_rows"] = has_rows
+                    if sample is not None:
+                        entry["first_row"] = sample
+                else:
+                    # Only the fields that say something. A readable table carries
+                    # its row; an unreadable one carries why not. Hence ragged.
+                    if state:
+                        entry["sqlstate"] = state
+                    if native:
+                        entry["native_error"] = native
+                    if msg:
+                        entry["message"] = msg
+                entries.append(entry)
+
+            if status == "ok":
+                detail = "%d column%s%s" % (ncols, "" if ncols == 1 else "s",
+                                            "" if has_rows else ", no rows")
+            else:
+                detail = FM_ERRORS.get(native, (None, msg))[1]
+                if len(detail) > 76:
+                    detail = detail[:73] + "..."
+            print("  [%4d/%d] %-9s %-44s %s" % (i, len(names), status, name, detail),
+                  flush=True)
+    finally:
+        if json_path is not None:
+            write_sample_json(json_path, cfg, timeout, entries, tally)
 
     print("\n%d probed: %s" % (len(names),
           ", ".join("%s %s" % (v, k) for k, v in sorted(tally.items()))))
@@ -481,6 +597,9 @@ def main():
                     help="restrict --list or --probe, LIKE style: --like '%%CHARGE%%'")
     ap.add_argument("--probe-timeout", type=int, default=30, metavar="SECONDS",
                     help="per-table query timeout for --probe (default 30)")
+    ap.add_argument("--json", metavar="PATH",
+                    help="with --probe, also write each readable table's first "
+                         "row to a ragged JSON file at PATH")
     ap.add_argument("--table", help="source table to pull and profile")
     ap.add_argument("--target", help="destination, default dsc.<lowercased source>")
     ap.add_argument("--limit", type=int, help="row limit for a first look")
@@ -501,6 +620,8 @@ def main():
 
     if not (args.list or args.probe or args.table):
         ap.error("one of --list, --probe, --table or --profile is required")
+    if args.json and not args.probe:
+        ap.error("--json is written by --probe; add --probe")
 
     fm_cn = connect_interactive(connect_filemaker, cfg["filemaker"], "FileMaker")
     # connect() authenticates but touches no data, so a session can open and
@@ -524,7 +645,7 @@ def main():
             print("No tables matched.")
             return 1
         pg_cn = connect_interactive(connect_postgres, cfg["postgres"], "PostgreSQL")
-        probe(fm_cn, pg_cn, cfg, names, args.probe_timeout)
+        probe(fm_cn, pg_cn, cfg, names, args.probe_timeout, args.json)
         return 0
 
     pg_cn = connect_interactive(connect_postgres, cfg["postgres"], "PostgreSQL")
