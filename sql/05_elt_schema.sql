@@ -178,4 +178,41 @@ SELECT max(finished_at)                          AS last_success,
 FROM   elt.load_run
 WHERE  status = 'succeeded';
 
+-- ---------------------------------------------------------------------------
+-- The current run
+-- ---------------------------------------------------------------------------
+-- Which run is in progress, for anything that wants to attribute a row to it
+-- without being passed the id. The extractor opens the load_run row on a
+-- separate autocommit connection before any work starts, so the row is
+-- committed and visible from the connection the transform runs on.
+--
+-- finished_at IS NULL, not max(run_id), so that a transform invoked by hand
+-- after a completed run attributes to nothing rather than to that run - rows
+-- found by an administrator should not read as rows the overnight job found.
+-- max() over the open rows because a crashed run leaves its row open forever;
+-- see elt.v_stalled_runs. A hand-run transform while an older run is stalled is
+-- the one case this gets wrong, and that view is what surfaces it.
+
+CREATE OR REPLACE FUNCTION elt.current_run_id() RETURNS bigint
+LANGUAGE sql STABLE AS $$
+    SELECT max(run_id) FROM elt.load_run WHERE finished_at IS NULL;
+$$;
+
+GRANT EXECUTE ON FUNCTION elt.current_run_id() TO svc_py;
+
+-- The parse register attributes its rows to the run that found them. The
+-- default lives here rather than in 03 because the function it calls is defined
+-- here; 03 creates the column without one. Guarded so this file can be run
+-- against a database where 03 has not been applied.
+DO $$
+BEGIN
+    IF to_regclass('stg.parse_errors') IS NOT NULL THEN
+        ALTER TABLE stg.parse_errors
+            ALTER COLUMN run_id SET DEFAULT elt.current_run_id();
+    ELSE
+        RAISE NOTICE 'stg.parse_errors not present; run 03 then re-run this file';
+    END IF;
+END $$;
+
+
 RESET ROLE;

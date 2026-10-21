@@ -3,19 +3,25 @@
 -- ---------------------------------------------------------------------------
 -- Builds and maintains the reporting tables from stg, incrementally: each is
 -- created once, and every run after that upserts only what has arrived in stg
--- since the last one. Currently rep.fact_incident and
--- rep.fact_incident_charge.
+-- since the last one. Currently:
+-- 		rep.fact_incident
+-- 		rep.fact_incident_charge
 --
--- How it runs. fm_extract.py calls elt.run_transforms() once every table has
+-- fm_extract.py calls elt.run_transforms() once every table has
 -- loaded and reconciled, passing the run's watermark ceiling as the as-at
--- date. It can also be called by hand at any time - it is idempotent, and
--- does nothing when nothing new has arrived:
+-- date. It can also be called by hand at any time and does nothing if
+-- nothing new has arrived:
 --
 --     CALL elt.run_transforms();
 --
 -- Adding a reporting table: write its CREATE TABLE and transform procedure
 -- below, following rep.transform_fact_incident, then add one CALL line to
--- elt.run_transforms. Re-run this file.
+-- elt.run_transforms. Re-run this file. Two further lines are easy to leave
+-- out: ALTER TABLE ... OWNER TO pp_owner above the SET ROLE, or rpt_reader
+-- never sees the table; and a call to stg.register_parse_failures, or a value
+-- the source will not let PostgreSQL cast coalesces to NULL unrecorded, and
+-- the reporting layer cannot tell it from a field that was empty. List every
+-- column the transform casts, with the type it casts to.
 --
 -- Every date and time column also carries a surrogate key into the conformed
 -- dimensions - date_occurred and date_occurred_key, and so on. Reports join
@@ -74,15 +80,6 @@ CREATE TABLE IF NOT EXISTS rep.fact_incident (
     loaded_at                    timestamp NOT NULL,   -- when this version reached stg
     transformed_at               timestamp NOT NULL DEFAULT clock_timestamp()
 );
-
--- For a table that already existed before these columns were added.
-ALTER TABLE rep.fact_incident
-    ADD COLUMN IF NOT EXISTS transformed_at      timestamp NOT NULL DEFAULT clock_timestamp(),
-    ADD COLUMN IF NOT EXISTS date_occurred_key   integer,
-    ADD COLUMN IF NOT EXISTS time_occurred_key   integer,
-    ADD COLUMN IF NOT EXISTS date_reported_key   integer,
-    ADD COLUMN IF NOT EXISTS time_received_key   integer,
-    ADD COLUMN IF NOT EXISTS time_dispatched_key integer;
 
 -- Each call takes everything that reached stg.pp since the previous call,
 -- keeps the latest version of each record, and upserts it.
@@ -215,6 +212,18 @@ BEGIN
 
     GET DIAGNOSTICS n_written = ROW_COUNT;
 
+    -- Register any value that will not cast, before the watermark moves past
+    -- it. A standing worklist: one row per distinct value, cleared by hand
+    -- once a rule handles it or the source is corrected.
+    CALL stg.register_parse_failures('stg.pp', '__pkeypolicepro_id', wm, batch_to,
+        ARRAY[['creation_date_timestamp',     'timestamp'],
+              ['modification_date_timestamp', 'timestamp'],
+              ['date_occurred',               'date'],
+              ['time_occurred',               'time'],
+              ['date',                        'date'],
+              ['time_received',               'time'],
+              ['time_dispatched',             'time']]);
+
     INSERT INTO elt.transform_watermark
            (target_table, source_table, last_loaded_at, source_as_at)
     VALUES ('rep.fact_incident', 'stg.pp', batch_to,
@@ -320,8 +329,6 @@ BEGIN
         code,
         class,
         offense,
-        -- nullif, so an empty string does not read as ticked. btrim('') is ''
-        -- and therefore NOT NULL, which would make every record an attempt.
         nullif(btrim(attempt), '')    IS NOT NULL,
         judge,
         stg.try_date(disp_date),
@@ -364,6 +371,12 @@ BEGIN
               >= rep.fact_incident_charge.modification_date_timestamp;
 
     GET DIAGNOSTICS n_written = ROW_COUNT;
+
+    CALL stg.register_parse_failures('stg.charges', '__pkeycharge_id', wm, batch_to,
+        ARRAY[['creation_timestamp',     'timestamp'],
+              ['modification_timestamp', 'timestamp'],
+              ['disp_date',              'date'],
+              ['counts',                 'numeric']]);
 
     INSERT INTO elt.transform_watermark
            (target_table, source_table, last_loaded_at, source_as_at)
