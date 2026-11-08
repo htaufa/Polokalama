@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS rep.fact_incident (
     narcotics_type               text,
     flag_mental_health           boolean,
     flag_significant             boolean,
+	dispatch_text				 text,
+	created_by					 text,
     loaded_at                    timestamp NOT NULL,   -- when this version reached stg
     transformed_at               timestamp NOT NULL DEFAULT clock_timestamp()
 );
@@ -124,7 +126,8 @@ BEGIN
         finalisation_status, incident_village, section,
         location, location_of_incident_street, location_of_incident_other,
         flag_alcohol, flag_domestic, flag_narcotics, narcotics_type,
-        flag_mental_health, flag_significant, loaded_at)
+        flag_mental_health, flag_significant, dispatch_text, created_by,
+		loaded_at)
     SELECT
         __pkeypolicepro_id,
         bltr,
@@ -157,6 +160,8 @@ BEGIN
         narcotics_type,
         nullif(btrim(mental_health), '')  IS NOT NULL,
         nullif(btrim(significant), '')    IS NOT NULL,
+		dispatch_concat,
+		created_by,
         loaded_at
     FROM (
         -- Latest version per record within this batch. Needed, not just
@@ -202,6 +207,8 @@ BEGIN
         narcotics_type              = EXCLUDED.narcotics_type,
         flag_mental_health          = EXCLUDED.flag_mental_health,
         flag_significant            = EXCLUDED.flag_significant,
+		dispatch_text				= EXCLUDED.dispatch_text,
+		created_by					= EXCLUDED.created_by,
         loaded_at                   = EXCLUDED.loaded_at,
         transformed_at              = clock_timestamp()
     -- Never let an older version overwrite a newer one. Normal loads arrive
@@ -500,6 +507,14 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rpt_reader') THEN
         EXECUTE 'GRANT SELECT ON rep.v_dim_coverage TO rpt_reader';
+        -- Every table in the schema, not only the ones created above. The
+        -- default privileges set in 01 apply at CREATE time and only to
+        -- objects created by pp_owner, so a table created while the session
+        -- was a superuser arrives with no grant - and ALTER TABLE ... OWNER
+        -- TO pp_owner does not backfill one. The symptom is a 42501
+        -- permission denied in Power BI for a table that plainly exists.
+        -- Re-running this file is what repairs it.
+        EXECUTE 'GRANT SELECT ON ALL TABLES IN SCHEMA rep TO rpt_reader';
     END IF;
 END $$;
 

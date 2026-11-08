@@ -97,6 +97,61 @@ BEGIN RETURN t::numeric; EXCEPTION WHEN others THEN RETURN NULL; END $$
 LANGUAGE plpgsql IMMUTABLE;
 
 -- ---------------------------------------------------------------------------
+-- Title case for Tongan text
+-- ---------------------------------------------------------------------------
+-- initcap() treats every non-alphanumeric character as a word boundary, so it
+-- returns Nuku'Alofa, Faka'Osi and Tu'I. Worse for the okina (U+02BB), which it
+-- does not treat as a boundary at all, leaving 'ovave entirely lowercase.
+--
+-- Tongan takes a lowercase letter after an apostrophe or okina unless the mark
+-- begins the word:
+--
+--   mark begins the word  -> capitalise:  'Eua, 'Ovave, 'U'anga, 'O
+--   mark is inside a word -> leave lower: Nuku'alofa, Faka'osi, A'u, Tu'i
+--
+-- This is deliberately Tongan-first. It therefore returns O'brien rather than
+-- O'Brien: no character rule can tell a European prefix from a short Tongan
+-- word of the same shape, and Tongan dominates this data. Surnames are
+-- rendered in upper case, where the question does not arise - O'BRIEN.
+--
+-- regexp_replace cannot express this: PostgreSQL has no way to change the case
+-- of a capture group in the replacement string. So this walks the characters.
+
+CREATE OR REPLACE FUNCTION stg.initcap_name(p_text text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+DECLARE
+    result   text := '';
+    boundary text := '[[:space:]()/,.&-]';
+    -- The mark capitalises only when nothing but a boundary precedes it, which
+    -- is to say when it begins the word.
+    lead     text := '(^|[[:space:]()/,.&-])$';
+    ch       text;
+    prev     text := ' ';   -- start of string behaves like a boundary
+    i        integer;
+BEGIN
+    FOR i IN 1 .. length(p_text) LOOP
+        ch := substr(p_text, i, 1);
+
+        IF prev ~ boundary THEN
+            result := result || upper(ch);                       -- word start
+
+        ELSIF prev IN ('''', U&'\02BB') THEN
+            IF substr(p_text, 1, i - 2) ~ lead THEN
+                result := result || upper(ch);
+            ELSE
+                result := result || lower(ch);
+            END IF;
+
+        ELSE
+            result := result || lower(ch);
+        END IF;
+
+        prev := ch;
+    END LOOP;
+    RETURN result;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- Parse exceptions
 -- ---------------------------------------------------------------------------
 -- Written by stg.register_parse_failures, below. run_id attributes a row to

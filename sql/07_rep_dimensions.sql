@@ -212,7 +212,9 @@ SELECT to_char(t, 'HH24MI')::integer,
             WHEN extract(hour FROM t) < 12 THEN 'Morning'
             WHEN extract(hour FROM t) < 18 THEN 'Afternoon'
             ELSE                                'Evening' END,
-       NULL
+       CASE WHEN extract(hour FROM t) < 8 THEN 'Night'
+	   		WHEN extract(hour FROM t) <16 THEN 'Day'
+			WHEN extract(hour FROM t) <24 THEN 'Evening' END
 FROM   generate_series(TIMESTAMP '2000-01-01 00:00',
                        TIMESTAMP '2000-01-01 23:59',
                        INTERVAL '1 minute') AS t
